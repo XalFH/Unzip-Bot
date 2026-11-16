@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -8,9 +9,13 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+# Fix event loop for Python 3.11+ BEFORE importing/initializing Pyrogram
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 from aiohttp import web
 from jinja2 import Environment, FileSystemLoader
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     CallbackQuery,
@@ -20,6 +25,12 @@ from pyrogram.types import (
 )
 
 import db
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # ================= CONFIGURATION =================
 API_ID = int(os.getenv("API_ID", "0"))
@@ -41,17 +52,12 @@ EXTRACT_DIR = WORK_DIR / "extracted"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Supported archive extensions
 SUPPORTED_EXTS = (
     ".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz",
     ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".gz", ".bz2", ".xz", ".cab", ".iso"
 )
 
-# In-memory state for password-protected archives
-# {user_id: {"archive_path": Path, "file_name": str, "file_size": int, "msg_id": int}}
 PENDING_PASSWORDS: dict[int, dict] = {}
-
-# Jinja2 template setup
 jinja_env = Environment(loader=FileSystemLoader(str(Path(__file__).parent)), autoescape=True)
 
 app = Client(
@@ -78,10 +84,6 @@ def is_supported_archive(filename: str) -> bool:
 
 
 def extract_archive_sync(archive_path: Path, out_dir: Path, password: str = "") -> tuple[str, str]:
-    """
-    Returns (status, error_msg)
-    status: 'ok' | 'need_password' | 'wrong_password' | 'error'
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["7z", "x", "-y", f"-p{password}", f"-o{str(out_dir)}", str(archive_path)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -90,12 +92,10 @@ def extract_archive_sync(archive_path: Path, out_dir: Path, password: str = "") 
     if proc.returncode == 0:
         return "ok", ""
 
-    # Check if password required / wrong password
     if any(k in output for k in ("wrong password", "can not open encrypted", "encrypted", "enter password")):
         shutil.rmtree(out_dir, ignore_errors=True)
         return ("wrong_password" if password else "need_password"), "Invalid or missing password."
 
-    # Fallback for RAR5/RAR via unrar-free if 7z couldn't open it
     if archive_path.suffix.lower() == ".rar":
         out_dir.mkdir(parents=True, exist_ok=True)
         unrar_cmd = ["unrar-free", "-x"]
@@ -142,15 +142,13 @@ def save_job_metadata(token: str, archive_name: str, files: list[dict]):
 
 
 async def cleanup_old_jobs():
-    """Auto-delete extracted files older than 2 hours to save Render disk space."""
     while True:
-        await asyncio.sleep(900)  # Check every 15 mins
+        await asyncio.sleep(900)
         now = time.time()
         for folder in EXTRACT_DIR.iterdir():
             if folder.is_dir():
                 try:
-                    age = now - folder.stat().st_mtime
-                    if age > 7200:  # 2 hours
+                    if now - folder.stat().st_mtime > 7200:
                         shutil.rmtree(folder, ignore_errors=True)
                 except Exception:
                     pass
@@ -159,7 +157,6 @@ async def cleanup_old_jobs():
 async def finalize_and_send(message: Message, status_msg: Message, archive_path: Path, file_name: str, file_size: int, out_dir: Path, token: str):
     files = collect_extracted_files(out_dir)
 
-    # Remove original downloaded archive to save space
     if archive_path.exists():
         archive_path.unlink(missing_ok=True)
 
@@ -169,7 +166,10 @@ async def finalize_and_send(message: Message, status_msg: Message, archive_path:
         return
 
     save_job_metadata(token, file_name, files)
-    await db.add_usage(message.from_user.id, file_size)
+    try:
+        await db.add_usage(message.from_user.id, file_size)
+    except Exception as e:
+        logger.error(f"DB add_usage error: {e}")
 
     cloud_url = f"{BASE_URL}/files/{token}"
     total_size = human_size(sum(f["size"] for f in files))
@@ -185,7 +185,6 @@ async def finalize_and_send(message: Message, status_msg: Message, archive_path:
         ]),
     )
 
-    # Send extracted files to user in Telegram (cap at 30 files to avoid floodwait)
     max_tg_send = 30
     sent_count = 0
     for f in files[:max_tg_send]:
@@ -198,8 +197,8 @@ async def finalize_and_send(message: Message, status_msg: Message, archive_path:
             )
             sent_count += 1
             await asyncio.sleep(0.6)
-        except Exception:
-            continue
+        except Exception as e:
+            logger.error(f"Send file error ({f['name']}): {e}")
 
     extra_note = ""
     if len(files) > max_tg_send:
@@ -221,8 +220,14 @@ async def finalize_and_send(message: Message, status_msg: Message, archive_path:
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, message: Message):
     u = message.from_user
-    await db.add_user(u.id, u.first_name or "", u.username or "")
-    user = await db.get_user(u.id)
+    logger.info(f"/start received from {u.id}")
+
+    try:
+        await db.add_user(u.id, u.first_name or "", u.username or "")
+        user = await db.get_user(u.id)
+    except Exception as e:
+        logger.error(f"MongoDB error in /start: {e}")
+        user = {"is_premium": False, "daily_used": 0}
 
     is_prem = user.get("is_premium") or (u.id in ADMIN_IDS)
     plan = "💎 PREMIUM (Unlimited)" if is_prem else "🆓 FREE (20 MB / Day)"
@@ -255,7 +260,10 @@ async def start_cmd(client: Client, message: Message):
 async def cb_handler(client: Client, cb: CallbackQuery):
     u = cb.from_user
     if cb.data == "my_quota":
-        user = await db.get_user(u.id)
+        try:
+            user = await db.get_user(u.id)
+        except Exception:
+            user = {"is_premium": False, "daily_used": 0}
         is_prem = user.get("is_premium") or (u.id in ADMIN_IDS)
         used = human_size(user.get("daily_used", 0))
         rem = "Unlimited" if is_prem else human_size(max(0, db.DAILY_LIMIT_BYTES - user.get("daily_used", 0)))
@@ -288,8 +296,6 @@ async def cancel_cmd(client: Client, message: Message):
 @app.on_message(filters.document & filters.private)
 async def handle_document(client: Client, message: Message):
     u = message.from_user
-    await db.add_user(u.id, u.first_name or "", u.username or "")
-
     doc = message.document
     file_name = doc.file_name or "archive.zip"
     file_size = doc.file_size or 0
@@ -301,7 +307,13 @@ async def handle_document(client: Client, message: Message):
         )
         return
 
-    allowed, remaining = await db.check_quota(u.id, file_size, ADMIN_IDS)
+    try:
+        await db.add_user(u.id, u.first_name or "", u.username or "")
+        allowed, remaining = await db.check_quota(u.id, file_size, ADMIN_IDS)
+    except Exception as e:
+        logger.error(f"DB quota error: {e}")
+        allowed, remaining = True, -1
+
     if not allowed:
         await message.reply_text(
             f"🚫 **Daily 20 MB Limit Reached!**\n\n"
@@ -452,7 +464,7 @@ async def broadcast_cmd(client: Client, message: Message):
     await prog.edit_text(f"✅ **Broadcast Done!**\nSent: `{sent}` | Failed: `{failed}`")
 
 
-# ================= WEB SERVER (CLOUD DOWNLOADS) =================
+# ================= WEB SERVER =================
 async def health_check(request: web.Request):
     return web.Response(text="Unzip Cloud Bot is Running!", content_type="text/plain")
 
@@ -490,7 +502,6 @@ async def download_file(request: web.Request):
     base_dir = (EXTRACT_DIR / token).resolve()
     target = (base_dir / rel_path).resolve()
 
-    # Path traversal protection
     if not str(target).startswith(str(base_dir)) or not target.is_file():
         return web.Response(text="File not found or expired.", status=404)
 
@@ -501,6 +512,8 @@ async def download_file(request: web.Request):
 
 
 async def start_services():
+    await db.ping_db()
+
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
     web_app.router.add_get("/files/{token}", files_page)
@@ -510,14 +523,16 @@ async def start_services():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Web server started on port {PORT} | Base URL: {BASE_URL}")
+    logger.info(f"Web server started on port {PORT} | Base URL: {BASE_URL}")
 
     asyncio.create_task(cleanup_old_jobs())
 
     await app.start()
-    print("Telegram Bot started successfully!")
-    await asyncio.Event().wait()
+    me = await app.get_me()
+    logger.info(f"Bot @{me.username} (ID: {me.id}) started successfully!")
+    await idle()
+    await app.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(start_services())
+    loop.run_until_complete(start_services())
