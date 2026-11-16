@@ -1,19 +1,31 @@
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 
+logger = logging.getLogger(__name__)
+
 MONGO_DB = os.getenv("MONGO_DB", "")
 DAILY_LIMIT_BYTES = 20 * 1024 * 1024  # 20 MB Daily Free Limit
 
-client = AsyncIOMotorClient(MONGO_DB)
+client = AsyncIOMotorClient(MONGO_DB, serverSelectionTimeoutMS=5000)
 db = client["unzip_premium_bot"]
 users_col = db["users"]
 
 
 def today_str() -> str:
-    # IST Date (UTC+5:30) for daily reset
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist).strftime("%Y-%m-%d")
+
+
+async def ping_db() -> bool:
+    try:
+        await client.admin.command("ping")
+        logger.info("MongoDB connected successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"MongoDB connection failed: {e}")
+        return False
 
 
 async def add_user(user_id: int, first_name: str = "", username: str = ""):
@@ -43,7 +55,6 @@ async def get_user(user_id: int) -> dict:
         await add_user(user_id)
         user = await users_col.find_one({"_id": user_id})
 
-    # Daily quota auto-reset check
     today = today_str()
     if user.get("last_date") != today:
         await users_col.update_one(
@@ -53,7 +64,6 @@ async def get_user(user_id: int) -> dict:
         user["daily_used"] = 0
         user["last_date"] = today
 
-    # Premium expiry check
     if user.get("is_premium") and user.get("premium_until"):
         expiry = user["premium_until"]
         if expiry.tzinfo is None:
@@ -70,13 +80,12 @@ async def get_user(user_id: int) -> dict:
 
 
 async def check_quota(user_id: int, file_size: int, admin_ids: list[int]) -> tuple[bool, int]:
-    """Returns (allowed: bool, remaining_bytes: int)"""
     if user_id in admin_ids:
-        return True, -1  # Unlimited
+        return True, -1
 
     user = await get_user(user_id)
     if user.get("is_premium"):
-        return True, -1  # Unlimited
+        return True, -1
 
     used = user.get("daily_used", 0)
     remaining = max(0, DAILY_LIMIT_BYTES - used)
