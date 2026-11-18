@@ -147,4 +147,44 @@ async def add_usage(user_id: int, file_size: int):
 
 async def set_premium(user_id: int, days: int):
     expiry = datetime.now(timezone.utc) + timedelta(days=days)
-    await
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"is_premium": True, "premium_until": expiry}},
+        upsert=True,
+    )
+    return expiry
+
+
+async def remove_premium(user_id: int):
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"is_premium": False, "premium_until": None}},
+    )
+
+
+async def set_ban_status(user_id: int, banned: bool):
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"is_banned": banned}},
+        upsert=True,
+    )
+
+
+async def get_stats() -> dict:
+    total = await users_col.count_documents({})
+    premium = await users_col.count_documents({"is_premium": True})
+    banned = await users_col.count_documents({"is_banned": True})
+    pipeline = [{"$group": {"_id": None, "extractions": {"$sum": "$total_extractions"}}}]
+    agg = await users_col.aggregate(pipeline).to_list(1)
+    extractions = agg[0]["extractions"] if agg else 0
+    return {
+        "total": total,
+        "premium": premium,
+        "banned": banned,
+        "extractions": extractions,
+    }
+
+
+async def get_all_user_ids() -> list[int]:
+    cursor = users_col.find({}, {"_id": 1})
+    return [doc["_id"] async for doc in cursor]
